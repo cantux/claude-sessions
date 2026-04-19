@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
-"""List Claude Code sessions with timestamps and opening prompt summaries."""
+"""Claude Code session manager — list, run, and export sessions."""
 
 import json
-import os
+import re
+import subprocess
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 SESSIONS_DIR = Path.home() / ".claude" / "projects"
+EXPORTS_DIR = Path.home() / ".claude" / "exports"
 
-SKIP_PREFIXES = ("<local-command-caveat>", "<local-command-stdout>", "<command-name>", "<command-message>", "# ")
+SKIP_PREFIXES = (
+    "<local-command-caveat>", "<local-command-stdout>",
+    "<command-name>", "<command-message>", "# ",
+)
+
+
+def _iter_session_files():
+    if not SESSIONS_DIR.exists():
+        return
+    for d in SESSIONS_DIR.iterdir():
+        if d.is_dir():
+            yield from d.glob("*.jsonl")
+
+
+def _mtime_snapshot():
+    return {f: f.stat().st_mtime for f in _iter_session_files()}
 
 
 def get_first_user_message(path):
@@ -77,6 +94,181 @@ def list_sessions(project_filter=None, width=90):
     print("\nResume: claude --resume <session-id>  |  Browse: claude --resume")
 
 
+def _extract_text(content):
+    """Render message content (str or list of blocks) to markdown."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "").strip()
+            if text:
+                parts.append(text)
+        elif btype == "tool_use":
+            name = block.get("name", "tool")
+            inp = block.get("input", {})
+            inp_str = json.dumps(inp, indent=2) if inp else "{}"
+            parts.append(f"**[Tool: {name}]**\n```json\n{inp_str}\n```")
+        elif btype == "tool_result":
+            result = block.get("content", "")
+            if isinstance(result, list):
+                result = " ".join(
+                    r.get("text", "") for r in result
+                    if isinstance(r, dict) and r.get("type") == "text"
+                )
+            snippet = str(result).strip()[:300]
+            if snippet:
+                parts.append(f"**[Tool result]**: {snippet}")
+    return "\n\n".join(parts)
+
+
+def _safe_filename(text, max_len=40):
+    text = text[:max_len]
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"\s+", "_", text.strip())
+    return text or "session"
+
+
+def export_session(session_path, output_path=None):
+    """Export a .jsonl session to a markdown file. Returns the output Path."""
+    session_path = Path(session_path)
+    project = session_path.parent.name
+    session_id = session_path.stem
+    mtime = datetime.fromtimestamp(session_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# Session {session_id[:8]}",
+        f"",
+        f"**Project**: `{project}`  ",
+        f"**Date**: {mtime}  ",
+        f"**File**: `{session_path}`",
+        "",
+        "---",
+        "",
+    ]
+
+    try:
+        with open(session_path) as f:
+            for raw in f:
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                role = obj.get("type")
+                if role not in ("user", "assistant"):
+                    continue
+                content = obj.get("message", {}).get("content", "")
+                text = _extract_text(content)
+                if not text:
+                    continue
+                if role == "user" and any(text.startswith(p) for p in SKIP_PREFIXES):
+                    continue
+                label = "**You**" if role == "user" else "**Claude**"
+                lines.append(f"{label}:\n\n{text}\n")
+                lines.append("---\n")
+    except Exception as e:
+        print(f"Error reading session: {e}", file=sys.stderr)
+        return None
+
+    md = "\n".join(lines)
+
+    if output_path is None:
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        first = _safe_filename(get_first_user_message(session_path))
+        filename = f"{session_id[:8]}_{first}.md"
+        output_path = EXPORTS_DIR / filename
+
+    output_path = Path(output_path)
+    output_path.write_text(md)
+    return output_path
+
+
+def _run_and_export(claude_args):
+    """Run claude, detect changed sessions afterward, export them."""
+    before = _mtime_snapshot()
+
+    subprocess.run(["claude"] + claude_args)
+
+    after = _mtime_snapshot()
+    changed = [f for f, mtime in after.items() if f not in before or before[f] != mtime]
+
+    for session_path in sorted(changed, key=lambda f: f.stat().st_mtime):
+        out = export_session(session_path)
+        if out:
+            print(f"\nSaved: {out}")
+
+
+def cmd_run(extra_args):
+    _run_and_export(extra_args)
+
+
+def cmd_resume(args):
+    if not args:
+        _run_and_export(["--resume"])
+    else:
+        _run_and_export(["--resume", args[0]])
+
+
+def cmd_export(args):
+    if not args:
+        print("Usage: claude-sessions export <session-id-prefix> [output.md]", file=sys.stderr)
+        sys.exit(1)
+
+    session_id = args[0]
+    output = Path(args[1]) if len(args) > 1 else None
+
+    match = next((f for f in _iter_session_files() if f.stem.startswith(session_id)), None)
+    if not match:
+        print(f"Session not found: {session_id}", file=sys.stderr)
+        sys.exit(1)
+
+    out = export_session(match, output)
+    if out:
+        print(f"Saved: {out}")
+
+
+USAGE = """\
+Usage: claude-sessions [command] [args]
+
+Commands:
+  list [filter]          List sessions, optionally filtered by project name (default)
+  run [-- claude-args]   Start a new session; export conversation after
+  resume [id]            Resume a session (interactive picker if no id); export after
+  export <id> [out]      Export an existing session to markdown
+
+Examples:
+  claude-sessions                        list all sessions
+  claude-sessions vcln                   list sessions for 'vcln' project
+  claude-sessions run                    new session, auto-save on exit
+  claude-sessions run -- --model opus    new session with model flag
+  claude-sessions resume                 interactive picker, then auto-save
+  claude-sessions resume bb105ece        resume specific session, auto-save
+  claude-sessions export bb105ece        export to ~/.claude/exports/
+  claude-sessions export bb105ece ~/out.md
+"""
+
+
 if __name__ == "__main__":
-    project_filter = sys.argv[1] if len(sys.argv) > 1 else None
-    list_sessions(project_filter)
+    argv = sys.argv[1:]
+
+    if not argv or argv[0] == "list":
+        project_filter = argv[1] if len(argv) > 1 else None
+        list_sessions(project_filter)
+    elif argv[0] == "run":
+        extra = argv[1:]
+        if extra and extra[0] == "--":
+            extra = extra[1:]
+        cmd_run(extra)
+    elif argv[0] == "resume":
+        cmd_resume(argv[1:])
+    elif argv[0] == "export":
+        cmd_export(argv[1:])
+    elif argv[0] in ("-h", "--help"):
+        print(USAGE)
+    else:
+        list_sessions(argv[0])
